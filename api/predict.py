@@ -42,6 +42,10 @@ def predict(symbol: str = Query("GOOG", description="Stock Ticker Symbol")):
     if data.empty:
         return {"error": f"No stock data found for ticker symbol: {symbol}"}
 
+    # Flatten MultiIndex columns if present (yfinance might return MultiIndex for single ticker)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
     # 2. Parse series (Close prices and dates)
     close_prices = data["Close"].values.flatten().tolist()
     dates = [str(d.date()) for d in data.index]
