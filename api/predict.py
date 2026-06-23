@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 import os
+import time
 
 app = FastAPI(title="Stock Price Prediction API", version="1.0.0")
 
@@ -22,6 +23,10 @@ app.add_middleware(
 MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Stock Prediction Model1.onnx")
 session = ort.InferenceSession(MODEL_PATH)
 
+# In-memory response cache
+CACHE = {}  # key: symbol, value: (timestamp, data_dict)
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
+
 
 @app.get("/")
 def root():
@@ -31,6 +36,14 @@ def root():
 @app.get("/api/predict")
 def predict(symbol: str = Query("GOOG", description="Stock Ticker Symbol")):
     symbol = symbol.strip().upper()
+
+    # Cache lookup
+    now = time.time()
+    if symbol in CACHE:
+        cached_time, cached_data = CACHE[symbol]
+        if now - cached_time < CACHE_TTL:
+            return cached_data
+
     start = "2012-01-01"
 
     # 1. Fetch stock data using yfinance
@@ -50,18 +63,22 @@ def predict(symbol: str = Query("GOOG", description="Stock Ticker Symbol")):
     close_prices = data["Close"].values.flatten().tolist()
     dates = [str(d.date()) for d in data.index]
 
-    # Prepare raw table data (Reversed: latest date first)
-    table_data = []
-    for i in range(len(data) - 1, -1, -1):
-        row = {
-            "date": str(data.index[i].date()),
-            "close": float(data["Close"].values[i]),
-            "open": float(data["Open"].values[i]),
-            "high": float(data["High"].values[i]),
-            "low": float(data["Low"].values[i]),
-            "volume": int(data["Volume"].values[i]),
-        }
-        table_data.append(row)
+    # Prepare raw table data (Vectorized)
+    temp_df = data[['Close', 'Open', 'High', 'Low', 'Volume']].fillna(0).copy()
+    temp_df['date'] = temp_df.index.strftime('%Y-%m-%d')
+    temp_df = temp_df.rename(columns={
+        'Close': 'close',
+        'Open': 'open',
+        'High': 'high',
+        'Low': 'low',
+        'Volume': 'volume'
+    })
+    temp_df['volume'] = temp_df['volume'].astype(int)
+    temp_df['close'] = temp_df['close'].astype(float)
+    temp_df['open'] = temp_df['open'].astype(float)
+    temp_df['high'] = temp_df['high'].astype(float)
+    temp_df['low'] = temp_df['low'].astype(float)
+    table_data = temp_df[['date', 'close', 'open', 'high', 'low', 'volume']].iloc[::-1].to_dict(orient='records')
 
     # 3. Calculate Moving Averages (filled with 0 for initial values)
     ma_50 = data["Close"].rolling(50).mean().fillna(0).values.flatten().tolist()
@@ -80,11 +97,14 @@ def predict(symbol: str = Query("GOOG", description="Stock Ticker Symbol")):
     data_test_combined = pd.concat([past_100_days, data_test], ignore_index=True)
     data_test_scaled = scaler.transform(data_test_combined)
 
-    x_test = []
-    y_test_actual = []
-    for i in range(100, len(data_test_scaled)):
-        x_test.append(data_test_scaled[i - 100 : i])
-        y_test_actual.append(data_test_scaled[i, 0])
+    M = len(data_test_scaled)
+    if M >= 100:
+        idx = np.arange(100) + np.arange(M - 100)[:, None]
+        x_test = data_test_scaled[idx]  # Shape: (M - 100, 100, 1)
+        y_test_actual = data_test_scaled[100:, 0]  # Shape: (M - 100,)
+    else:
+        x_test = np.array([], dtype=np.float32)
+        y_test_actual = np.array([], dtype=np.float32)
 
     x_test = np.array(x_test, dtype=np.float32)  # Shape: (N, 100, 1)
 
@@ -104,7 +124,7 @@ def predict(symbol: str = Query("GOOG", description="Stock Ticker Symbol")):
         y_actual_prices = (np.array(y_test_actual) * scale_factor).tolist()
         test_dates = [str(d.date()) for d in data.index[split_idx:]]
 
-    return {
+    response_data = {
         "symbol": symbol,
         "dates": dates,
         "close": close_prices,
@@ -118,3 +138,8 @@ def predict(symbol: str = Query("GOOG", description="Stock Ticker Symbol")):
             "predicted": y_predicted_prices,
         },
     }
+
+    # Store successful prediction in the cache
+    CACHE[symbol] = (now, response_data)
+
+    return response_data
